@@ -1,0 +1,2 @@
+../Core/Src/UART.c:12:6:Continue_On_UART_Receive	2
+../Core/Src/UART.c:27:6:Send_ADC_Values_Over_UART	1
