@@ -24,6 +24,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include "UART.h"
 
 /* USER CODE END Includes */
 
@@ -55,9 +56,16 @@ static uint8_t ADS1115_REG_CONFIG = 0x01; // Register address for configuration
 static uint8_t ADS1115_REG_LO_THRESH = 0x02; // Register address for low threshold
 static uint8_t ADS1115_REG_HI_THRESH = 0x03; // Register address for high threshold
 
-uint16_t ads1115_config = 0b0100001011100011; // 15: OS, 14:12: MUX, 11:9: PGA, 8: MODE, 7:5: DR, 4: COMP_MODE, 3: COMP_POL, 2: COMP_LAT, 1:0: COMP_QUE
+uint16_t ads1115_config = 0b0000001011100011; // 15: OS, 14:12: MUX, 11:9: PGA, 8: MODE, 7:5: DR, 4: COMP_MODE, 3: COMP_POL, 2: COMP_LAT, 1:0: COMP_QUE
 uint16_t ads1115_low_thresh = 32768; // 0V
 uint16_t ads1115_high_thresh = 58024; // 3V
+
+// To use these masks, do ads1115_config | ads1115_config_a0_gnd
+// Note that the default ads1115_config is set to 000, which is A0 relative to A1
+uint16_t ads1115_config_a0_gnd = 0b0100000000000000; // Mask to select reading voltage between A0 and GND
+uint16_t ads1115_config_a1_gnd = 0b0101000000000000; // Mask for A1 reading relative to GND
+uint16_t ads1115_config_a2_gnd = 0b0110000000000000; // Mask for A2 reading relative to GND
+uint16_t ads1115_config_a3_gnd = 0b0111000000000000; // Mask for A0 reading relative to A1
 
 /* USER CODE END PV */
 
@@ -69,8 +77,10 @@ static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 static void ADS1115_Init(void);
-static void ADS1115_Select_Register(uint8_t* reg);
-static void ADS1115_Write(uint8_t* reg, uint16_t* data);
+static void ADS1115_Thresh_Init(void);
+static void ADS1115_I2C_Reset(void);
+static HAL_StatusTypeDef ADS1115_Select_Register(uint8_t* reg);
+static HAL_StatusTypeDef ADS1115_Write(uint8_t* reg, uint16_t* data);
 static int16_t ADS1115_Read(void);
 
 static HAL_StatusTypeDef I2C_Transmit(I2C_HandleTypeDef* hi2c, uint16_t DevAddress, uint8_t* pData, uint16_t Size, uint32_t Timeout);
@@ -117,43 +127,40 @@ int main(void)
   /* USER CODE BEGIN 2 */
   
   HAL_Delay(100);
-  ADS1115_Init();
+  ADS1115_I2C_Reset(); // Init is called inside here
   HAL_Delay(100);
 
   HAL_StatusTypeDef status = HAL_I2C_IsDeviceReady(&hi2c1, ADS1115_ADDR, 1, HAL_MAX_DELAY);
-  char msg[50];
-  sprintf(msg, "ADS1115 Status: %d\r\n", status);
-  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  uint16_t iters = 0;
-  uint32_t previous_time;
-
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    
+    // This function waits until 's' is received on UART to continue
+    // This way, from the Python script we can command the STM32 chip operate only when we tell it to
+    //Continue_On_UART_Receive(huart2);
 
-    ADS1115_Read(); // Read the ADC value
-    iters++;
-    if (HAL_GetTick() - previous_time > 1000) {
-      HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+	  HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin); // Toggle the LED high when we're collecting or sending values
 
-      previous_time = HAL_GetTick();
-
-      sprintf(msg, "ADC Value: %d\r\n", ADS1115_Read());
-      HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-
-      // print number iters in one second
-      sprintf(msg, "Iterations per second: %d\r\n", iters);
-      HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-
-      iters = 0;
+    // Get 100 samples the slow way
+    // At 860 SPS, 2ms delay should be enough to not get repeat values
+    int32_t ads_data_sum = 0;
+    for (int i = 0; i < 100; i++) {
+      ads_data_sum += ADS1115_Read(); // Read the ADC value
+      HAL_Delay(2);
     }
+
+    int32_t ads_voltage_averaged = ads_data_sum / 100 * 8.192 * 1000000 / 65536; // uV bc. *1e6 to get full precision in an integer
+
+    Send_ADC_Values_Over_UART(huart2, ads_voltage_averaged);
+
+	  HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
   }
   /* USER CODE END 3 */
 }
@@ -299,26 +306,80 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-static void ADS1115_Init(void)
-{
+static void ADS1115_Init(void) {
   ADS1115_Write(&ADS1115_REG_CONFIG, &ads1115_config);
-  ADS1115_Write(&ADS1115_REG_LO_THRESH, &ads1115_low_thresh);
-  ADS1115_Write(&ADS1115_REG_HI_THRESH, &ads1115_high_thresh);
   ADS1115_Select_Register(&ADS1115_REG_CONVERSION); // Select conversion register for reading from
 }
 
-static void ADS1115_Select_Register(uint8_t* reg) {
-  uint8_t buf[1] = {*reg}; // Buffer to send, first byte is the register address
-  I2C_Transmit(&hi2c1, ADS1115_ADDR, buf, sizeof(buf), HAL_MAX_DELAY);
+static void ADS1115_Thresh_Init(void) {
+  ADS1115_Write(&ADS1115_REG_LO_THRESH, &ads1115_low_thresh);
+  ADS1115_Write(&ADS1115_REG_HI_THRESH, &ads1115_high_thresh);
 }
 
-static void ADS1115_Write(uint8_t* reg, uint16_t* data) {
+// See: https://community.st.com/t5/stm32-mcus-products/i2c-hal-busy/td-p/620525
+static void ADS1115_I2C_Reset(void){
+  // Attempt to write config
+  HAL_StatusTypeDef status = ADS1115_Write(&ADS1115_REG_CONFIG, &ads1115_config);
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  if (status != HAL_OK){
+    HAL_I2C_DeInit(&hi2c1); // De-initialize the I2C peripheral before settings pins as GPIOs
+    HAL_Delay(10);  // Brief delay to ensure peripheral resets
+
+    // Init the SCL GPIO as an open-drain GPIO output
+    GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    // Send 9 pulses on SCL and keep SDA high
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET); // SDA high
+    for (int i = 0; i < 9; i++){
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+      HAL_Delay(20);
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+      HAL_Delay(20);
+    }
+
+    // Generate a STOP condition to release the bus
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);  // SDA low
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);    // SCL high
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);    // SDA high
+    HAL_Delay(10);  // Stabilize bus
+    MX_I2C1_Init();
+
+    status = HAL_I2C_IsDeviceReady(&hi2c1, ADS1115_ADDR, 1, HAL_MAX_DELAY);
+
+    // print the status to UART
+    char msg[50];
+    sprintf(msg, "ADS1115 Reset Status: %d\r\n", status);
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    if (status == HAL_OK) {
+      ADS1115_Init();
+    } else{
+      ADS1115_I2C_Reset(); // Try again, ad infinitum
+      uint32_t error = HAL_I2C_GetError(&hi2c1);
+      sprintf(msg, "I2C Error Code: %lu\r\n", error);
+      HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    }
+  }
+}
+
+static HAL_StatusTypeDef ADS1115_Select_Register(uint8_t* reg) {
+  uint8_t buf[1] = {*reg}; // Buffer to send, first byte is the register address
+  return I2C_Transmit(&hi2c1, ADS1115_ADDR, buf, sizeof(buf), HAL_MAX_DELAY);
+}
+
+static HAL_StatusTypeDef ADS1115_Write(uint8_t* reg, uint16_t* data) {
   // Write this better later, this data length this is stupid what if the msb is actually 0x00 and you want to send that
   uint8_t data_byte_msb = (uint8_t)((*data >> 8) & 0xFF); // First byte of data to send, most significant byte
   uint8_t data_byte_lsb = (uint8_t)(*data & 0xFF); // Least significant byte, with 0xFF mask to clear the upper 8 bits, probably not needed
   uint8_t buf[3] = {*reg, data_byte_msb, data_byte_lsb}; // Buffer to send, first byte is the register address, second and third are the data bytes
   uint8_t buf_len = data_byte_msb == 0x00 ? 2 : 3; // If msb if empty, only send register and lsb byte
-  I2C_Transmit(&hi2c1, ADS1115_ADDR, buf, buf_len, HAL_MAX_DELAY);
+  return I2C_Transmit(&hi2c1, ADS1115_ADDR, buf, buf_len, HAL_MAX_DELAY);
 }
 
 // This reads from whatever register was last selected. Note that both Select_Register and Write functions will select the register to either read or write to
@@ -327,14 +388,13 @@ static int16_t ADS1115_Read(void) {
   I2C_Receive(&hi2c1, ADS1115_ADDR, buf, sizeof(buf), HAL_MAX_DELAY);
   int16_t ads_data = (buf[0] << 8) | buf[1]; // Combine the two bytes into a single 16-bit value
   int32_t ads_voltage = ads_data * 8.192 * 1000000 / 65536; // Output in uV to get full precision, going to need to dynamically change the full scale range of the ADC and this variable
-  char msg[50];
-  snprintf(msg, sizeof(msg), "ADC Value: %ld\r\n", ads_voltage);
+  //char msg[50];
+  //snprintf(msg, sizeof(msg), "ADC Value: %ld\r\n", ads_voltage);
   //HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);  
-  return (int16_t)(ads_voltage/1000);
+  return ads_data;
 }
 
-static HAL_StatusTypeDef I2C_Transmit(I2C_HandleTypeDef* hi2c, uint16_t DevAddress, uint8_t* pData, uint16_t Size, uint32_t Timeout)
-{
+static HAL_StatusTypeDef I2C_Transmit(I2C_HandleTypeDef* hi2c, uint16_t DevAddress, uint8_t* pData, uint16_t Size, uint32_t Timeout) {
   HAL_StatusTypeDef status = HAL_I2C_Master_Transmit(hi2c, DevAddress, pData, Size, Timeout);
   if (status != HAL_OK)
   {
@@ -346,8 +406,7 @@ static HAL_StatusTypeDef I2C_Transmit(I2C_HandleTypeDef* hi2c, uint16_t DevAddre
   return status;
 }
 
-static HAL_StatusTypeDef I2C_Receive(I2C_HandleTypeDef* hi2c, uint16_t DevAddress, uint8_t* pData, uint16_t Size, uint32_t Timeout)
-{
+static HAL_StatusTypeDef I2C_Receive(I2C_HandleTypeDef* hi2c, uint16_t DevAddress, uint8_t* pData, uint16_t Size, uint32_t Timeout) {
   HAL_StatusTypeDef status = HAL_I2C_Master_Receive(hi2c, DevAddress, pData, Size, Timeout);
   if (status != HAL_OK)
   {
