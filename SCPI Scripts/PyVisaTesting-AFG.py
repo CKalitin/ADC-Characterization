@@ -2,7 +2,7 @@ import pyvisa
 import time
 import numpy as np
 
-rm = pyvisa.ResourceManager('@py')
+rm = pyvisa.ResourceManager()
 
 print(rm.list_resources())
 print(rm)

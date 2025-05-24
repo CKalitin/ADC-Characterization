@@ -5,7 +5,7 @@ from datetime import datetime
 
 import HelperFunctions as hf
 
-rm = pyvisa.ResourceManager('@py')
+rm = pyvisa.ResourceManager()
 
 # You'll need to copy paste some of the IDs here into the rm.open_resource() functions below
 print(rm.list_resources())
